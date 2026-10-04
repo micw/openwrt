@@ -1,0 +1,13 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Configure fullflash LAN before dnsmasq and odhcpd start.
+. /lib/functions.sh
+
+[ "$(board_name)" = 'tuoshi,lt22m-fullflash' ] || exit 0
+
+uci -q set dhcp.lan.ignore='1' || exit 1
+uci -q set dhcp.lan.dhcpv4='disabled' || exit 1
+uci -q set dhcp.lan.dhcpv6='disabled' || exit 1
+uci -q set dhcp.lan.ra='disabled' || exit 1
+uci -q set dhcp.lan.ndp='disabled' || exit 1
+uci commit dhcp || exit 1
