@@ -1,0 +1,20 @@
+Subject: [PATCH] mips: mtmips: identify LT22M U-Boot family in SPL
+
+Print a board-specific family marker after initializing the SPL serial
+console. Keep the marker in SPL rather than the generic MT7628 image.
+
+---
+
+diff --git a/arch/mips/mach-mtmips/spl.c b/arch/mips/mach-mtmips/spl.c
+--- a/arch/mips/mach-mtmips/spl.c
++++ b/arch/mips/mach-mtmips/spl.c
+@@ -23,6 +23,9 @@ void __noreturn board_init_f(ulong dummy)
+ 	 */
+ 	mtmips_spl_serial_init();
+ 	preloader_console_init();
++#ifdef CONFIG_BOARD_TUOSHI_LT22M
++	puts("LT22M_OPENWRT_UBOOT_FAMILY_V1\n");
++#endif
+ #endif
+ 
+ 	board_init_r(NULL, 0);

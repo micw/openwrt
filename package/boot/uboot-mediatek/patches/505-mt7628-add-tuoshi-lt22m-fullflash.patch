@@ -1,0 +1,733 @@
+Subject: [PATCH] mips: mt7628: add Tuoshi LT22M full-NOR bootloader variant
+
+Provide the full 16-MiB SPI-NOR layout, dual uImage magic and no empty
+command repetition. Override inherited bootcmd with checked NOR boot,
+and import the validated Factory LAN MAC in RAM even if ethaddr exists.
+Support reset-button TFTP initramfs recovery in RAM with bounded uploads.
+Light all six front LEDs during U-Boot as on stock; retain the existing
+mobile-LED error and TFTP patterns, turn all off before kernel handoff.
+Never write Factory or env. Use 20-MHz SPI reads, retaining 1 MHz for
+environment loading. CRC is not authentication: use a trusted LAN.
+This does not install or flash U-Boot on any device.
+
+---
+
+diff --git a/arch/mips/dts/Makefile b/arch/mips/dts/Makefile
+--- a/arch/mips/dts/Makefile
++++ b/arch/mips/dts/Makefile
+@@ -19,6 +19,7 @@
+ dtb-$(CONFIG_BOARD_MT7621_RFB) += mediatek,mt7621-rfb.dtb
+ dtb-$(CONFIG_BOARD_MT7621_NAND_RFB) += mediatek,mt7621-nand-rfb.dtb
+ dtb-$(CONFIG_BOARD_MT7628_RFB) += mediatek,mt7628-rfb.dtb
++dtb-$(CONFIG_BOARD_TUOSHI_LT22M) += tuoshi_lt22m_fullflash.dtb
+ dtb-$(CONFIG_BOARD_GARDENA_SMART_GATEWAY_MT7688) += gardena-smart-gateway-mt7688.dtb
+ dtb-$(CONFIG_BOARD_LINKIT_SMART_7688) += linkit-smart-7688.dtb
+ dtb-$(CONFIG_TARGET_OCTEON_EBB7304) += mrvl,octeon-ebb7304.dtb
+
+diff --git a/arch/mips/mach-mtmips/Kconfig b/arch/mips/mach-mtmips/Kconfig
+--- a/arch/mips/mach-mtmips/Kconfig
++++ b/arch/mips/mach-mtmips/Kconfig
+@@ -2,7 +2,7 @@
+ 	depends on ARCH_MTMIPS
+ 
+ config SYS_VENDOR
+-	default "mediatek" if BOARD_MT7628_RFB || BOARD_MT7620_RFB || BOARD_MT7620_MT7530_RFB
++	default "mediatek" if BOARD_MT7628_RFB || BOARD_TUOSHI_LT22M || BOARD_MT7620_RFB || BOARD_MT7620_MT7530_RFB
+ 
+ config SYS_MALLOC_F_LEN
+ 	default 0x1000
+
+diff --git a/arch/mips/mach-mtmips/mt7628/Kconfig b/arch/mips/mach-mtmips/mt7628/Kconfig
+--- a/arch/mips/mach-mtmips/mt7628/Kconfig
++++ b/arch/mips/mach-mtmips/mt7628/Kconfig
+@@ -27,6 +27,12 @@
+ 	  SPI-NOR flash, 1 built-in switch with 5 ports, 1 UART, 1 USB host,
+ 	  1 SDXC, 1 PCIe socket and JTAG pins.
+ 
++config BOARD_TUOSHI_LT22M
++	bool "Tuoshi LT22M 4G Wireless Router"
++	select BOARD_LATE_INIT
++	help
++	  MT7628 router with 64 MiB DDR2, 16 MiB SPI NOR and two LAN ports.
++
+ config BOARD_VOCORE2
+ 	bool "VoCore2"
+ 	select SPL_SERIAL
+@@ -37,6 +43,22 @@
+ 
+ endchoice
+ 
++config TUOSHI_LT22M_STOCK_MAGIC
++	bool "Also accept Tuoshi stock legacy uImage magic"
++	depends on BOARD_TUOSHI_LT22M
++	default y
++	help
++	  Accept the stock image magic 0x27151967 in addition to the
++	  standard uImage magic 0x27051956. Header/data CRC checks still apply.
++
++config TUOSHI_LT22M_NO_EMPTY_REPEAT
++	bool "Do not repeat commands on empty Enter"
++	depends on BOARD_TUOSHI_LT22M
++	default y
++	help
++	  In the simple U-Boot CLI ignore empty lines instead of re-running
++	  the last command, particularly important after SPI erase/write.
++
+ config SPL_UART2_SPIS_PINMUX
+ 	bool "Use alternative pinmux for UART2 in SPL stage"
+ 	depends on SPL_SERIAL
+@@ -46,10 +68,10 @@
+ 
+ config SYS_BOARD
+ 	string "Board name"
+-	default "mt7628" if BOARD_MT7628_RFB
++	default "mt7628" if BOARD_MT7628_RFB || BOARD_TUOSHI_LT22M
+ 
+ config SYS_CONFIG_NAME
+-	default "mt7628" if BOARD_MT7628_RFB
++	default "mt7628" if BOARD_MT7628_RFB || BOARD_TUOSHI_LT22M
+ 
+ source "board/gardena/smart-gateway-mt7688/Kconfig"
+ source "board/seeed/linkit-smart-7688/Kconfig"
+
+diff --git a/common/cli_simple.c b/common/cli_simple.c
+--- a/common/cli_simple.c
++++ b/common/cli_simple.c
+@@ -281,6 +281,12 @@
+ 			bootretry_reset_cmd_timeout();
+ 		}
+ 		len = cli_readline(CONFIG_SYS_PROMPT);
++
++		/* LT22M: a blank Enter must not repeat a previous sf erase/write. */
++		if (IS_ENABLED(CONFIG_TUOSHI_LT22M_NO_EMPTY_REPEAT) && len == 0) {
++			lastcommand[0] = '\0';
++			continue;
++		}
+ 
+ 		flag = 0;	/* assume no special flags for now */
+ 		if (len > 0)
+
+diff --git a/include/image.h b/include/image.h
+--- a/include/image.h
++++ b/include/image.h
+@@ -313,6 +313,7 @@
+ 
+ #define LZ4F_MAGIC	0x184D2204	/* LZ4 Magic Number		*/
+ #define IH_MAGIC	0x27051956	/* Image Magic Number		*/
++#define IH_TUOSHI_LT22M_MAGIC 0x27151967 /* Stock LT22M uImage magic */
+ #define IH_NMLEN		32	/* Image Name Length		*/
+ 
+ /* Reused from common.h */
+@@ -947,7 +948,11 @@
+ 
+ static inline int image_check_magic(const struct legacy_img_hdr *hdr)
+ {
+-	return (image_get_magic(hdr) == IH_MAGIC);
++	uint32_t magic = image_get_magic(hdr);
++
++	return magic == IH_MAGIC ||
++		(IS_ENABLED(CONFIG_TUOSHI_LT22M_STOCK_MAGIC) &&
++		 magic == IH_TUOSHI_LT22M_MAGIC);
+ }
+ 
+ static inline int image_check_type(const struct legacy_img_hdr *hdr, uint8_t type)
+
+diff --git a/net/tftp.c b/net/tftp.c
+--- a/net/tftp.c
++++ b/net/tftp.c
+@@ -89,6 +89,11 @@
+ static ulong	tftp_block_wrap_offset;
+ static int	tftp_state;
+ static ulong	tftp_load_addr;
++#ifdef CONFIG_BOARD_TUOSHI_LT22M
++/* A recovery upload must never reach relocated U-Boot in the 64-MiB RAM. */
++static bool lt22m_tftp_server_upload;
++#define LT22M_TFTP_RECOVERY_MAX_SIZE 0x800000UL
++#endif
+ #ifdef CONFIG_TFTP_TSIZE
+ /* The file size reported by the server */
+ static unsigned int tftp_tsize;
+@@ -163,6 +168,16 @@
+ 	ulong newsize = offset + len;
+ 	ulong store_addr = tftp_load_addr + offset;
+ 	void *ptr;
++
++#ifdef CONFIG_BOARD_TUOSHI_LT22M
++	/* Bound anonymous WRQ data *before* any packet is copied into RAM. */
++	if (lt22m_tftp_server_upload &&
++	    (newsize < offset || store_addr < tftp_load_addr ||
++	     newsize > LT22M_TFTP_RECOVERY_MAX_SIZE)) {
++		puts("\nLT22M recovery: TFTP image exceeds 8-MiB RAM limit\n");
++		return -1;
++	}
++#endif
+ 
+ 	if (CONFIG_IS_ENABLED(LMB)) {
+ 		if (store_addr < tftp_load_addr ||
+@@ -768,6 +783,10 @@
+ {
+ 	__maybe_unused char *ep;             /* Environment pointer */
+ 
++#ifdef CONFIG_BOARD_TUOSHI_LT22M
++	lt22m_tftp_server_upload = false;
++#endif
++
+ 	if (saved_tftp_block_size_option) {
+ 		tftp_block_size_option = saved_tftp_block_size_option;
+ 		saved_tftp_block_size_option = 0;
+@@ -950,6 +969,9 @@
+ #ifdef CONFIG_CMD_TFTPSRV
+ void tftp_start_server(void)
+ {
++#ifdef CONFIG_BOARD_TUOSHI_LT22M
++	lt22m_tftp_server_upload = true;
++#endif
+ 	tftp_filename[0] = 0;
+ 
+ 	tftp_init_load_addr();
+
+diff --git a/arch/mips/dts/tuoshi_lt22m_fullflash.dts b/arch/mips/dts/tuoshi_lt22m_fullflash.dts
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/dts/tuoshi_lt22m_fullflash.dts
+@@ -0,0 +1,133 @@
++// SPDX-License-Identifier: GPL-2.0+
++/* Tuoshi LT22M: full 16-MiB NOR firmware layout.
++ * U-Boot, environment and unique factory data remain outside the firmware
++ * partition. This DT alone neither erases the old stock slots nor boots Linux.
++ */
++
++/dts-v1/;
++
++#include "mt7628a.dtsi"
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++
++/ {
++	compatible = "tuoshi,lt22m", "ralink,mt7628a-soc";
++	model = "Tuoshi LT22M 4G Wireless Router";
++
++	aliases {
++		serial0 = &uart0;
++		spi0 = &spi0;
++	};
++
++	chosen {
++		stdout-path = &uart0;
++	};
++
++	leds {
++		compatible = "gpio-leds";
++
++		wlan {
++			label = "lt22m:wlan";
++			gpios = <&gpio1 12 GPIO_ACTIVE_LOW>;
++		};
++
++		lan0 {
++			label = "lt22m:lan0";
++			gpios = <&gpio1 11 GPIO_ACTIVE_LOW>;
++		};
++
++		lan1 {
++			label = "lt22m:lan1";
++			gpios = <&gpio1 10 GPIO_ACTIVE_LOW>;
++		};
++
++		mobile-2g {
++			label = "lt22m:2g";
++			gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;
++		};
++
++		mobile-3g {
++			label = "lt22m:3g";
++			gpios = <&gpio0 0 GPIO_ACTIVE_LOW>;
++		};
++
++		mobile-4g {
++			label = "lt22m:4g";
++			gpios = <&gpio1 5 GPIO_ACTIVE_LOW>;
++		};
++	};
++
++	keys {
++		compatible = "gpio-keys";
++
++		reset {
++			label = "reset";
++			gpios = <&gpio1 6 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_RESTART>;
++		};
++	};
++};
++
++&state_default {
++	board-leds-reset {
++		/* U-Boot uses wled_a/p0led_a/p1led_a where Linux uses
++		 * wled_an/p0led_an/p1led_an. GPIO 0/2: i2s; 37: refclk;
++		 * 38: wdt; 42/43/44: LAN1/LAN0/WLAN LED anodes.
++		 */
++		groups = "i2s", "refclk", "wdt", "p0led_a", "p1led_a",
++			 "wled_a";
++		function = "gpio";
++	};
++};
++
++&uart0 {
++	status = "okay";
++};
++
++&spi0 {
++	status = "okay";
++	num-cs = <1>;
++
++	spi-flash@0 {
++		compatible = "jedec,spi-nor";
++		reg = <0>;
++		spi-max-frequency = <25000000>;
++		#address-cells = <1>;
++		#size-cells = <1>;
++
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			partition@0 {
++				label = "u-boot";
++				reg = <0x000000 0x030000>;
++				read-only;
++			};
++
++			partition@30000 {
++				label = "u-boot-env";
++				reg = <0x030000 0x010000>;
++				read-only;
++			};
++
++			partition@40000 {
++				label = "factory";
++				reg = <0x040000 0x010000>;
++				read-only;
++			};
++
++			partition@50000 {
++				label = "firmware";
++				reg = <0x050000 0xfb0000>;
++			};
++		};
++	};
++};
++
++&eth {
++	/* Physical ports 0 and 1 are LAN; do not isolate WAN port 0. */
++	pinctrl-names = "default";
++	pinctrl-0 = <&ephy_router_mode>;
++};
+
+diff --git a/board/mediatek/mt7628/Makefile b/board/mediatek/mt7628/Makefile
+new file mode 100644
+--- /dev/null
++++ b/board/mediatek/mt7628/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0+
++
++obj-$(CONFIG_BOARD_TUOSHI_LT22M) += lt22m.o
+
+diff --git a/board/mediatek/mt7628/lt22m.c b/board/mediatek/mt7628/lt22m.c
+new file mode 100644
+--- /dev/null
++++ b/board/mediatek/mt7628/lt22m.c
+@@ -0,0 +1,309 @@
++// SPDX-License-Identifier: GPL-2.0+
++/* Tuoshi LT22M: import the unique LAN MAC from read-only Factory data. */
++
++#include <button.h>
++#include <command.h>
++#include <cyclic.h>
++#include <env.h>
++#include <image.h>
++#include <init.h>
++#include <led.h>
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/kernel.h>
++#include <net.h>
++#include <spi_flash.h>
++#include <stdio.h>
++#include <string.h>
++
++#define LT22M_FACTORY_OFFSET		0x40000
++#define LT22M_LAN_MAC_OFFSET		0x28
++#define LT22M_FIRMWARE_OFFSET		0x50000
++#define LT22M_FIRMWARE_SIZE		0xfb0000
++#define LT22M_KERNEL_LOAD_ADDR		0x82000000
++/* Keep the compressed image below relocated U-Boot; decompressed kernels
++ * are limited to 16 MiB by CONFIG_SYS_BOOTM_LEN at 0x80000000.
++ */
++#define LT22M_MAX_KERNEL_IMAGE_SIZE	0x800000
++
++#define LT22M_LED_2G	BIT(0)
++#define LT22M_LED_3G	BIT(1)
++#define LT22M_LED_4G	BIT(2)
++#define LT22M_LED_ALL	(LT22M_LED_2G | LT22M_LED_3G | LT22M_LED_4G)
++
++static struct udevice *lt22m_leds[6];
++static struct cyclic_info lt22m_tftp_led_cyclic;
++static bool lt22m_tftp_receiving;
++
++static void lt22m_leds_init(void)
++{
++	static const char *const labels[] = {
++		"lt22m:2g", "lt22m:3g", "lt22m:4g",
++		"lt22m:wlan", "lt22m:lan0", "lt22m:lan1"
++	};
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(labels); i++) {
++		if (led_get_by_label(labels[i], &lt22m_leds[i]))
++			printf("LT22M: status LED %s unavailable\n", labels[i]);
++	}
++}
++
++static void lt22m_leds_set(unsigned int mask)
++{
++	int i;
++
++	/* Existing recovery and error patterns control only the mobile LEDs. */
++	for (i = 0; i < 3; i++) {
++		if (lt22m_leds[i])
++			led_set_state(lt22m_leds[i], mask & BIT(i) ?
++				      LEDST_ON : LEDST_OFF);
++	}
++}
++
++static void lt22m_front_leds_set(enum led_state_t state)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(lt22m_leds); i++) {
++		if (lt22m_leds[i])
++			led_set_state(lt22m_leds[i], state);
++	}
++}
++
++static void lt22m_leds_blink(unsigned int period_ms)
++{
++	int i;
++
++	for (i = 0; i < 3; i++) {
++		if (lt22m_leds[i] &&
++		    !led_set_period(lt22m_leds[i], period_ms))
++			led_set_state(lt22m_leds[i], LEDST_BLINK);
++	}
++}
++
++static void lt22m_leds_error(void)
++{
++	int i;
++
++	for (i = 0; i < 3; i++) {
++		lt22m_leds_set(LT22M_LED_ALL);
++		mdelay(120);
++		lt22m_leds_set(0);
++		mdelay(120);
++	}
++}
++
++static void lt22m_tftp_led_progress(struct cyclic_info *cyclic)
++{
++	if (!lt22m_tftp_receiving && net_boot_file_size) {
++		lt22m_tftp_receiving = true;
++		lt22m_leds_blink(250);
++	}
++}
++
++static bool lt22m_valid_ram_image(u32 received, bool recovery)
++{
++	struct legacy_img_hdr *hdr = (void *)LT22M_KERNEL_LOAD_ADDR;
++
++	if (received <= sizeof(*hdr) ||
++	    received > LT22M_MAX_KERNEL_IMAGE_SIZE ||
++	    !image_check_magic(hdr) || !image_check_hcrc(hdr) ||
++	    !image_check_os(hdr, IH_OS_LINUX) ||
++	    !image_check_type(hdr, IH_TYPE_KERNEL) ||
++	    !image_check_target_arch(hdr) ||
++	    image_get_image_size(hdr) != received ||
++	    !image_check_dcrc(hdr))
++		return false;
++
++	/* Restrict recovery to the expected standalone OpenWrt kernel format.
++	 * Exact received length rejects appended SquashFS, but a forged uImage
++	 * is still possible: CRC is integrity, NOT authentication.
++	 */
++	return !recovery || (image_get_magic(hdr) == IH_MAGIC &&
++			     image_get_load(hdr) == 0x80000000 &&
++			     image_get_ep(hdr) == 0x80000000 &&
++			     image_get_comp(hdr) == IH_COMP_LZMA);
++}
++
++static int lt22m_recovery(void)
++{
++	int ret;
++
++	if (!env_get("ipaddr"))
++		env_set("ipaddr", "192.168.188.1");
++
++	puts("LT22M: RAM-only TFTP recovery. Upload a standard OpenWrt initramfs\n");
++	puts("LT22M: to the router IP; no SPI erase/write is performed.\n");
++	puts("LT22M: CRC is not authentication; use an isolated trusted LAN.\n");
++	for (;;) {
++		lt22m_leds_blink(1000);
++		lt22m_tftp_receiving = false;
++		image_load_addr = LT22M_KERNEL_LOAD_ADDR;
++		cyclic_register(&lt22m_tftp_led_cyclic, lt22m_tftp_led_progress,
++				100000, "lt22m_tftp_led");
++		ret = net_loop(TFTPSRV);
++		cyclic_unregister(&lt22m_tftp_led_cyclic);
++
++		if (ret == -EINTR) {
++			lt22m_leds_set(0);
++			return CMD_RET_FAILURE;
++		}
++		if (ret > 0 &&
++		    lt22m_valid_ram_image(net_boot_file_size, true)) {
++			printf("LT22M: verified %u-byte RAM recovery image\n",
++			       net_boot_file_size);
++			lt22m_leds_set(LT22M_LED_ALL);
++			mdelay(250);
++			lt22m_front_leds_set(LEDST_OFF);
++			/* A successful kernel boot never returns. */
++			run_command("bootm 0x82000000", 0);
++			puts("LT22M: recovery kernel returned unexpectedly\n");
++		} else {
++			puts("LT22M: TFTP failed or image invalid; retrying\n");
++		}
++		lt22m_leds_error();
++	}
++}
++
++static int do_lt22mrecovery(struct cmd_tbl *cmdtp, int flag, int argc,
++			    char *const argv[])
++{
++	return lt22m_recovery();
++}
++
++U_BOOT_CMD(lt22mrecovery, 1, 0, do_lt22mrecovery,
++	   "receive and boot a checked OpenWrt initramfs via TFTP (RAM only)", "");
++
++static int lt22m_boot_failure(void)
++{
++	/* All three radio-generation LEDs on together cannot be normal LTE. */
++	lt22m_leds_set(LT22M_LED_ALL);
++	mdelay(1000);
++	return lt22m_recovery();
++}
++
++static int do_lt22mboot(struct cmd_tbl *cmdtp, int flag, int argc,
++			char *const argv[])
++{
++	struct legacy_img_hdr hdr;
++	struct legacy_img_hdr *loaded = (void *)LT22M_KERNEL_LOAD_ADDR;
++	struct spi_flash *flash;
++	u32 size;
++	int ret;
++
++	flash = spi_flash_probe(CONFIG_SF_DEFAULT_BUS, CONFIG_SF_DEFAULT_CS,
++				CONFIG_SF_DEFAULT_SPEED, CONFIG_SF_DEFAULT_MODE);
++	if (!flash) {
++		puts("LT22M: cannot probe SPI NOR for firmware\n");
++		return lt22m_boot_failure();
++	}
++
++	ret = spi_flash_read(flash, LT22M_FIRMWARE_OFFSET, sizeof(hdr), &hdr);
++	if (ret || !image_check_magic(&hdr) || !image_check_hcrc(&hdr) ||
++	    !image_check_os(&hdr, IH_OS_LINUX) ||
++	    !image_check_type(&hdr, IH_TYPE_KERNEL) ||
++	    !image_check_target_arch(&hdr)) {
++		puts("LT22M: no valid Linux uImage header at 0x50000\n");
++		goto fail;
++	}
++
++	size = image_get_image_size(&hdr);
++	if (size <= sizeof(hdr) || size > LT22M_MAX_KERNEL_IMAGE_SIZE ||
++	    size > LT22M_FIRMWARE_SIZE ||
++	    flash->size <= LT22M_FIRMWARE_OFFSET ||
++	    size > flash->size - LT22M_FIRMWARE_OFFSET) {
++		puts("LT22M: firmware kernel image exceeds safe RAM/flash bounds\n");
++		goto fail;
++	}
++
++	ret = spi_flash_read(flash, LT22M_FIRMWARE_OFFSET, size, loaded);
++	spi_flash_free(flash);
++	if (ret || !image_check_magic(loaded) || !image_check_hcrc(loaded) ||
++	    image_get_image_size(loaded) != size ||
++	    !image_check_dcrc(loaded)) {
++		puts("LT22M: firmware kernel readback or CRC failed\n");
++		return lt22m_boot_failure();
++	}
++
++	printf("LT22M: booting verified %u-byte kernel from 0x50000\n", size);
++	lt22m_leds_set(LT22M_LED_ALL);
++	mdelay(250);
++	lt22m_front_leds_set(LEDST_OFF);
++	/* A successful kernel boot never returns. */
++	run_command("bootm 0x82000000", 0);
++	puts("LT22M: firmware kernel returned unexpectedly\n");
++	return lt22m_boot_failure();
++
++fail:
++	spi_flash_free(flash);
++	return lt22m_boot_failure();
++}
++
++U_BOOT_CMD(lt22mboot, 1, 0, do_lt22mboot,
++	   "boot verified Linux uImage from LT22M firmware in SPI NOR", "");
++
++int board_late_init(void)
++{
++	struct spi_flash *flash;
++	struct udevice *reset_button;
++	u8 mac[6];
++	char mac_string[ARP_HLEN_ASCII + 1];
++	int ret;
++	int cmd_ret, delay_ret;
++
++	/* The saved stock environment can contain any bootcmd. Never execute
++	 * a legacy command implicitly: always use the bounded, checked NOR
++	 * boot or button-selected RAM-only recovery. Do not call saveenv().
++	 */
++	cmd_ret = env_set("bootcmd", "lt22mboot");
++	delay_ret = env_set("bootdelay", "3");
++	if (cmd_ret || delay_ret)
++		puts("LT22M: could not set RAM-only boot policy\n");
++
++	lt22m_leds_init();
++	/* Match stock U-Boot: all six front LEDs lit until kernel handoff. */
++	lt22m_front_leds_set(LEDST_ON);
++
++	if (!button_get_by_label("reset", &reset_button) &&
++	    button_get_state(reset_button) == BUTTON_ON) {
++		/* Require a deliberate hold, not a short switch bounce. */
++		mdelay(1000);
++		if (button_get_state(reset_button) == BUTTON_ON) {
++			puts("LT22M: reset held at power-on; RAM-only TFTP recovery\n");
++			cmd_ret = env_set("bootcmd", "lt22mrecovery");
++			delay_ret = env_set("bootdelay", "1");
++			if (cmd_ret || delay_ret)
++				puts("LT22M: could not select RAM recovery\n");
++		}
++	}
++
++	/* Runs after env_import and before Ethernet initialization. Never
++	 * write back to the legacy U-Boot environment or to Factory.
++	 */
++	flash = spi_flash_probe(CONFIG_SF_DEFAULT_BUS, CONFIG_SF_DEFAULT_CS,
++				CONFIG_SF_DEFAULT_SPEED, CONFIG_SF_DEFAULT_MODE);
++	if (!flash) {
++		puts("LT22M: cannot probe SPI NOR for Factory MAC\n");
++		return 0;
++	}
++
++	ret = spi_flash_read(flash, LT22M_FACTORY_OFFSET +
++			     LT22M_LAN_MAC_OFFSET, sizeof(mac), mac);
++	spi_flash_free(flash);
++	if (ret || !is_valid_ethaddr(mac)) {
++		puts("LT22M: missing or invalid Factory LAN MAC\n");
++		return 0;
++	}
++
++	/* eth_env_set_enetaddr() refuses to replace an existing valid MAC,
++	 * even with CONFIG_ENV_OVERWRITE. Set the checked Factory value via
++	 * env_set() directly, in RAM only; never save the old environment.
++	 */
++	snprintf(mac_string, sizeof(mac_string), "%pM", mac);
++	if (env_set("ethaddr", mac_string))
++		puts("LT22M: could not set Factory LAN MAC in RAM\n");
++
++	return 0;
++}
+
+diff --git a/configs/tuoshi_lt22m_fullflash_defconfig b/configs/tuoshi_lt22m_fullflash_defconfig
+new file mode 100644
+--- /dev/null
++++ b/configs/tuoshi_lt22m_fullflash_defconfig
+@@ -0,0 +1,77 @@
++CONFIG_MIPS=y
++CONFIG_SKIP_LOWLEVEL_INIT=y
++CONFIG_SYS_MALLOC_LEN=0x100000
++CONFIG_SPL_LIBCOMMON_SUPPORT=y
++CONFIG_SPL_LIBGENERIC_SUPPORT=y
++CONFIG_NR_DRAM_BANKS=1
++CONFIG_ENV_SIZE=0x1000
++CONFIG_ENV_OFFSET=0x30000
++CONFIG_ENV_SECT_SIZE=0x10000
++CONFIG_DEFAULT_DEVICE_TREE="tuoshi_lt22m_fullflash"
++CONFIG_SPL_SYS_MALLOC_F_LEN=0x40000
++CONFIG_SPL_SERIAL=y
++CONFIG_SPL_BSS_START_ADDR=0x80010000
++CONFIG_SPL_BSS_MAX_SIZE=0x10000
++CONFIG_SYS_BOOTM_LEN=0x1000000
++CONFIG_SYS_LOAD_ADDR=0x80010000
++CONFIG_SPL=y
++CONFIG_ARCH_MTMIPS=y
++CONFIG_SOC_MT7628=y
++# Same MT7628 low-level board directory, dedicated LT22M board selection.
++CONFIG_BOARD_TUOSHI_LT22M=y
++CONFIG_TUOSHI_LT22M_STOCK_MAGIC=y
++CONFIG_TUOSHI_LT22M_NO_EMPTY_REPEAT=y
++CONFIG_SYS_MIPS_TIMER_FREQ=290000000
++CONFIG_MIPS_CACHE_SETUP=y
++CONFIG_MIPS_CACHE_DISABLE=y
++CONFIG_RESTORE_EXCEPTION_VECTOR_BASE=y
++CONFIG_MIPS_BOOT_FDT=y
++CONFIG_FIT=y
++# CONFIG_ARCH_FIXUP_FDT_MEMORY is not set
++CONFIG_SYS_CONSOLE_INFO_QUIET=y
++CONFIG_SYS_MALLOC_BOOTPARAMS=y
++CONFIG_SPL_MAX_SIZE=0x10000
++CONFIG_SPL_SYS_MALLOC_SIMPLE=y
++CONFIG_SPL_NOR_SUPPORT=y
++# CONFIG_CMD_ELF is not set
++# CONFIG_CMD_XIMG is not set
++# CONFIG_CMD_CRC32 is not set
++# CONFIG_CMD_DM is not set
++CONFIG_CMD_GPIO=y
++CONFIG_BUTTON=y
++CONFIG_BUTTON_GPIO=y
++CONFIG_CMD_BUTTON=y
++CONFIG_LED=y
++CONFIG_LED_GPIO=y
++CONFIG_LED_SW_BLINK=y
++CONFIG_CMD_LED=y
++# CONFIG_CMD_LOADS is not set
++CONFIG_CMD_SPI=y
++CONFIG_CMD_TFTPPUT=y
++CONFIG_CMD_TFTPSRV=y
++CONFIG_MTD=y
++CONFIG_SPI_FLASH_MTD=y
++CONFIG_CMD_MTD=y
++CONFIG_ENV_IS_IN_SPI_FLASH=y
++# Keep the tiny legacy environment read at the proven 1-MHz speed.
++CONFIG_ENV_SPI_MAX_HZ=1000000
++CONFIG_ENV_OVERWRITE=y
++CONFIG_ENV_RELOC_GD_ENV_ADDR=y
++CONFIG_NET_RANDOM_ETHADDR=y
++# CONFIG_INPUT is not set
++CONFIG_SPI_FLASH_EON=y
++CONFIG_SPI_FLASH_GIGADEVICE=y
++CONFIG_SPI_FLASH_ISSI=y
++CONFIG_SPI_FLASH_MACRONIX=y
++CONFIG_SPI_FLASH_SPANSION=y
++CONFIG_SPI_FLASH_STMICRO=y
++CONFIG_SPI_FLASH_WINBOND=y
++CONFIG_SPI_FLASH_XMC=y
++# Applies to lt22mboot/sf; actual SCK is bus clock / integer divider.
++CONFIG_SF_DEFAULT_SPEED=20000000
++CONFIG_MT7628_ETH=y
++CONFIG_SPI=y
++CONFIG_MT7621_SPI=y
++CONFIG_LZMA=y
++CONFIG_SPL_LZMA=y
++CONFIG_BAUDRATE=57600
