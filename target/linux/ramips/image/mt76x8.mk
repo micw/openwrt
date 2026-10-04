@@ -1276,7 +1276,7 @@ define Device/tuoshi_lt22m
   DEVICE_VENDOR := Tuoshi
   DEVICE_MODEL := LT22M 4G Wireless Router
   DEVICE_PACKAGES := kmod-usb2 kmod-usb-ohci kmod-usb-net-rndis \
-	kmod-usb-serial-option uboot-envtools dumpimage
+	kmod-usb-serial-option uboot-envtools dumpimage lt22m-bootloader
   UIMAGE_MAGIC := 0x27151967
   UIMAGE_NAME := JBoneCloud M7628NNxCPET
   IMAGES := sysupgrade.bin factory.bin

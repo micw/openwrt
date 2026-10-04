@@ -1,0 +1,337 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# LT22M bootloader tools. No operation writes flash except an explicit flash.
+
+. /lib/functions.sh
+
+set -eu
+
+LOADER=/usr/share/lt22m/u-boot-with-spl.bin
+MANIFEST=/usr/share/lt22m/bootloader.sha256
+CHECKER=/usr/sbin/lt22m-image-check
+STOCK_SHA=45eb1fbce7dbd5ede73054e5d1870c5e131f1cd8f0b641844889afae2421542b
+# Older LT22M custom loader which was flashed, read back and booted on hardware.
+OLD_CUSTOM_SHA=93d134decf49c97b215e83de2546fa5a34793a47a262ed0d414141651bcaf356
+PART_SIZE=196608
+TMP=
+
+fail() { echo "LT22M: $*" >&2; exit 1; }
+cleanup() { [ -z "$TMP" ] || rm -rf -- "$TMP"; }
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+usage() {
+	echo 'Usage: lt22m-bootloader inspect [dump-file] | dump OUTPUT | flash bundled | flash DUMP-FILE' >&2
+	exit 2
+}
+
+[ "$#" -ge 1 ] || usage
+action=$1
+shift
+
+# The MTD numbering below belongs ONLY to the original Linux stock layout.
+# Never infer a partition from a label on an unrecognized layout.
+check_device() {
+	case "$(board_name)" in
+	tuoshi,lt22m) layout=stock ;;
+	tuoshi,lt22m-fullflash) layout=fullflash ;;
+	*) fail 'wrong board' ;;
+	esac
+	[ -r /proc/mtd ] || fail 'no MTD map'
+	if [ "$layout" = stock ]; then
+		entries='3:fwconcat0:00770000:327680:1 4:stock-storage:00040000:8126464:1 5:fwconcat1:00050000:8388608:1 6:stock-firmware2:00770000:8716288:1 7:fwconcat2:00040000:16515072:1'
+	else
+		entries='3:firmware:00fb0000:327680:1'
+	fi
+	for entry in '0:u-boot:00030000:0:1' \
+		'1:u-boot-env:00010000:196608:1' \
+		'2:factory:00010000:262144:0' $entries; do
+		n=${entry%%:*}
+		rest=${entry#*:}; name=${rest%%:*}
+		rest=${rest#*:}; size=${rest%%:*}
+		rest=${rest#*:}; offset=${rest%%:*}
+		write=${rest##*:}
+		awk -v n="mtd$n:" -v name="\"$name\"" -v size="$size" \
+			'$1 == n && $2 == size && $3 == "00010000" && $4 == name { found=1 }
+			 END { exit !found }' /proc/mtd || fail "unexpected mtd$n"
+		sys=/sys/class/mtd/mtd$n
+		[ "$(sed -n '1p' "$sys/offset")" = "$offset" ] || fail "mtd$n offset"
+		[ "$(sed -n '1p' "$sys/size")" = "$((0x$size))" ] || fail "mtd$n size"
+		[ "$(sed -n '1p' "$sys/erasesize")" = 65536 ] || fail "mtd$n erasesize"
+		flags=$(sed -n '1p' "$sys/flags")
+		case "$flags" in 0x[0-9a-fA-F]*) ;; *) fail "mtd$n flags" ;; esac
+		if [ "$write" = 1 ]; then
+			[ "$((flags & 0x400))" -ne 0 ] || fail "mtd$n not writable"
+		else
+			[ "$((flags & 0x400))" -eq 0 ] || fail "mtd$n not protected"
+		fi
+	done
+	if [ "$layout" = stock ]; then
+		awk '$1 == "mtd8:" && $2 == "00800000" && $3 == "00010000" &&
+			$4 == "\"firmware\"" { found=1 } END { exit !found }' /proc/mtd ||
+			fail 'unexpected firmware concat'
+	fi
+}
+
+# A backup needs only the physical loader partition; do not require any
+# particular firmware-slot layout or write permissions for the other MTDs.
+check_boot_partition() {
+	case "$(board_name)" in
+	tuoshi,lt22m|tuoshi,lt22m-fullflash) ;;
+	*) fail 'wrong board' ;;
+	esac
+	awk '$1 == "mtd0:" && $2 == "00030000" && $3 == "00010000" &&
+		$4 == "\"u-boot\"" { found=1 } END { exit !found }' /proc/mtd ||
+		fail 'unexpected bootloader partition'
+	[ "$(sed -n '1p' /sys/class/mtd/mtd0/offset 2>/dev/null)" = 0 ] &&
+		[ "$(sed -n '1p' /sys/class/mtd/mtd0/size 2>/dev/null)" = 196608 ] &&
+		[ "$(sed -n '1p' /sys/class/mtd/mtd0/erasesize 2>/dev/null)" = 65536 ] ||
+		fail 'unexpected bootloader geometry'
+}
+
+new_temp() { TMP=$(mktemp -d /tmp/lt22m-bootloader.XXXXXXXX) || fail 'no temporary space'; }
+hash() { sha256sum "$1" | cut -d ' ' -f 1; }
+
+# Recognition is informative, not authorization. A user-provided loader can
+# be unknown; the known bundled hash just permits a more specific diagnosis.
+prepare_bundled() {
+	BUNDLED_SHA=
+	[ -f "$LOADER" ] && [ ! -L "$LOADER" ] || return 0
+	bytes=$(wc -c < "$LOADER")
+	[ "$bytes" -gt 0 ] && [ "$bytes" -le "$PART_SIZE" ] || return 0
+	[ -f "$MANIFEST" ] && [ ! -L "$MANIFEST" ] || return 0
+	[ "$(sed -n '1p' "$MANIFEST")" = "$(hash "$LOADER")" ] || return 0
+	"$CHECKER" loader "$LOADER" >/dev/null || return 0
+	pad_image "$LOADER" "$TMP/bundled-padded"
+	BUNDLED_SHA=$(hash "$TMP/bundled-padded")
+}
+
+# Write a raw loader or full partition dump as exactly three NOR eraseblocks.
+pad_image() {
+	dd if=/dev/zero bs=65536 count=3 2>/dev/null | tr '\000' '\377' > "$2"
+	dd if="$1" of="$2" conv=notrunc 2>/dev/null || fail 'cannot pad loader'
+	[ "$(wc -c < "$2")" -eq "$PART_SIZE" ] || fail 'loader padding'
+}
+
+identify() {
+	file=$1
+	[ -f "$file" ] && [ ! -L "$file" ] || fail 'not a regular image file'
+	loader_info=$("$CHECKER" loader "$file" 2>/dev/null) || loader_info=
+	bytes=$(wc -c < "$file")
+	if [ "$bytes" -eq "$PART_SIZE" ]; then
+		sum=$(hash "$file")
+		case "$sum" in
+		"$STOCK_SHA") kind=stock ;;
+		"$OLD_CUSTOM_SHA") kind=old-custom ;;
+		*) kind=unknown ;;
+		esac
+		[ -z "$loader_info" ] || kind=openwrt
+		if [ -n "$BUNDLED_SHA" ] && [ "$sum" = "$BUNDLED_SHA" ]; then kind=bundled; fi
+	elif [ -n "$BUNDLED_SHA" ] &&
+		[ "$bytes" -eq "$(wc -c < "$LOADER")" ] && cmp -s "$file" "$LOADER"; then
+		kind=bundled-raw
+		sum=$(hash "$file")
+	else
+		kind=unknown
+		sum=$(hash "$file")
+		[ -z "$loader_info" ] || kind=openwrt
+	fi
+	case "$kind" in
+	stock)
+		identity='original LT22M U-Boot'
+		version='U-Boot 1.1.3 (Apr 2 2021 - 10:40:12)'
+		policy='Boot A; restore A from B if A is rejected' ;;
+	bundled|bundled-raw|openwrt)
+		identity='LT22M OpenWrt U-Boot'
+		version=$(printf '%s\n' "$loader_info" | sed -n '2p')
+		[ -n "$version" ] || version='version unknown'
+		policy='Boot A at 0x050000; stock B is not used' ;;
+	old-custom)
+		identity='previously tested LT22M U-Boot'
+		version='version unknown'
+		policy='Boot A at 0x050000; stock B is not used' ;;
+	*) identity='UNKNOWN bootloader - compatibility cannot be determined'; version=; policy= ;;
+	esac
+	printf 'Detected: %s\n' "$identity"
+	[ -z "$version" ] || printf 'Version: %s\n' "$version"
+	[ -z "$policy" ] || printf 'Boot policy: %s\n' "$policy"
+	printf 'Size: %s bytes\nSHA-256: %s\n' "$bytes" "$sum"
+}
+
+# Scan only a recognized loader's firmware slots. Missing/corrupt slots are
+# reported, never treated as authorization or a veto for an operator write.
+scan_slots() {
+	[ "$kind" = unknown ] && return 0
+	printf '\nCurrent layout: %s\n' "$layout"
+	if [ "$layout" = stock ]; then
+		for spec in 'A:3:0:7798784' 'B:6:0:7798784'; do
+			slot=${spec%%:*}; rest=${spec#*:}; part=${rest%%:*}
+			rest=${rest#*:}; off=${rest%%:*}; size=${rest##*:}
+			scan_slot "$slot" "$part" "$off" "$size"
+			if [ "$slot" = A ]; then
+				a_valid=$slot_valid; a_oem=$slot_oem
+			else
+				b_valid=$slot_valid; b_oem=$slot_oem
+			fi
+		done
+	else
+		scan_slot A 3 0 7798784
+		a_valid=$slot_valid; a_oem=$slot_oem
+		# Physical B 0x850000, relative to the 0x50000 firmware partition.
+		scan_slot B 3 8388608 7798784
+		b_valid=$slot_valid; b_oem=$slot_oem
+	fi
+	case "$kind" in
+	stock)
+		a_stock=$((a_valid * a_oem))
+		b_stock=$((b_valid * b_oem))
+		if [ "$a_stock" -eq 1 ]; then
+			echo 'Compatibility: COMPATIBLE with current image in A'
+		elif [ "$b_stock" -eq 1 ]; then
+			echo 'Compatibility: COMPATIBLE via fallback image in B'
+		else
+			echo 'Compatibility: NOT COMPATIBLE - no stock-bootable image in A or B'
+		fi
+		if [ "$a_valid" -eq 1 ] && [ "$a_oem" -eq 0 ]; then
+			echo 'A has valid CRCs, but the stock bootloader rejects standard uImage magic 0x27051956.'
+		fi
+		if [ "$b_valid" -eq 1 ] && [ "$b_oem" -eq 0 ]; then
+			echo 'B has valid CRCs, but the stock bootloader rejects standard uImage magic 0x27051956.'
+		fi
+		printf '\n'
+		[ "$a_stock" -eq 1 ] || echo 'WARNING: No stock-bootable image in A.'
+		[ "$b_stock" -eq 1 ] || echo 'WARNING: No stock-bootable fallback image in B.'
+		if [ "$a_stock" -eq 0 ] && [ "$b_stock" -eq 0 ]; then
+			echo 'WARNING: With this stock bootloader, the system will probably not boot.'
+		elif [ "$b_stock" -eq 0 ]; then
+			echo 'The stock bootloader cannot restore A if A is rejected.'
+		else
+			echo 'WARNING: The stock bootloader may overwrite A from B if A is rejected.'
+		fi ;;
+	bundled|bundled-raw|openwrt|old-custom)
+		if [ "$a_valid" -eq 1 ]; then
+			echo 'Compatibility: COMPATIBLE with current image in A'
+		else
+			echo 'Compatibility: NOT COMPATIBLE with current image in A'
+		fi ;;
+	esac
+}
+scan_slot() {
+	slot=$1 part=$2 off=$3 size=$4
+	slot_valid=0; slot_oem=0
+	if [ "$slot" = A ]; then physical=0x050000; else physical=0x850000; fi
+	if [ "$slot" = B ] && [ "$layout" = fullflash ]; then
+		physical='0x850000 (former stock slot)'
+	fi
+	if [ ! -r "/dev/mtd$part" ]; then
+		printf '%s at %s: unavailable\n' "$slot" "$physical"
+	elif "$CHECKER" slot "/dev/mtd$part" "$off" "$size" > "$TMP/slot-result"; then
+		slot_valid=1
+		slot_result=$(sed -n '1p' "$TMP/slot-result")
+		case "$slot_result" in 'OEM '*) slot_oem=1 ;; esac
+		printf '%s at %s: %s\n' "$slot" "$physical" "$slot_result"
+	else
+		printf '%s at %s: %s\n' "$slot" "$physical" "$(sed -n '1p' "$TMP/slot-result")"
+	fi
+}
+
+case "$action" in
+inspect)
+	[ "$#" -le 1 ] || usage
+	new_temp; prepare_bundled
+	if [ "$#" -eq 0 ]; then
+		check_device
+		dd if=/dev/mtd0 of="$TMP/current" bs=65536 count=3 2>/dev/null || fail 'cannot read loader'
+		[ "$(wc -c < "$TMP/current")" -eq "$PART_SIZE" ] || fail 'loader short read'
+		printf 'Source: installed u-boot (mtd0, %s layout)\n' "$layout"
+		identify "$TMP/current"
+	else
+		check_device
+		printf 'Source: %s\n' "$1"
+		identify "$1"
+	fi
+	scan_slots
+	;;
+dump)
+	[ "$#" -eq 1 ] || usage
+	check_boot_partition
+	new_temp; prepare_bundled
+	[ ! -e "$1" ] && [ ! -L "$1" ] || fail 'output already exists'
+	umask 077
+	# A temporary file in the destination directory makes publication atomic.
+	out=$1
+	case "$out" in */*) dir=${out%/*} ;; *) dir=. ;; esac
+	[ -d "$dir" ] || fail 'output directory missing'
+	file=$(mktemp "$dir/.lt22m-bootloader.XXXXXXXX") || fail 'cannot create backup'
+	trap 'rm -f -- "$file"; cleanup' EXIT
+	dd if=/dev/mtd0 of="$file" bs=65536 count=3 2>/dev/null || fail 'cannot read bootloader'
+	[ "$(wc -c < "$file")" -eq "$PART_SIZE" ] || fail 'bootloader dump short'
+	# ln is atomic and refuses to overwrite a concurrent destination.
+	ln "$file" "$out" || fail 'output already exists'
+	rm -f -- "$file"
+	trap cleanup EXIT
+	echo 'Source: u-boot (mtd0, 0x000000-0x02ffff)'
+	identify "$out"
+	printf 'Saved: %s\n' "$out"
+	;;
+flash)
+	[ "$#" -eq 1 ] || usage
+	check_device
+	new_temp; prepare_bundled
+	if [ "$1" = bundled ]; then source=$LOADER; else source=$1; fi
+	[ -f "$source" ] && [ ! -L "$source" ] || fail 'loader must be a regular file'
+	bytes=$(wc -c < "$source")
+	[ "$bytes" -gt 0 ] && [ "$bytes" -le "$PART_SIZE" ] ||
+		fail 'loader must contain 1 to 196608 bytes'
+	cp "$source" "$TMP/candidate" || fail 'cannot copy loader'
+	[ "$(wc -c < "$TMP/candidate")" -eq "$bytes" ] || fail 'loader changed during copy'
+	printf 'Source: %s\n' "$source"
+	identify "$TMP/candidate"
+	candidate_bytes=$bytes
+	pad_image "$TMP/candidate" "$TMP/candidate-padded"
+	mv "$TMP/candidate-padded" "$TMP/candidate"
+	wanted=$(hash "$TMP/candidate")
+	[ "${#wanted}" -eq 64 ] || fail 'cannot hash candidate'
+	dd if=/dev/mtd0 of="$TMP/installed" bs=65536 count=3 2>/dev/null || fail 'cannot read installed loader'
+	[ "$(wc -c < "$TMP/installed")" -eq "$PART_SIZE" ] || fail 'installed loader short read'
+	current=$(hash "$TMP/installed")
+	[ "${#current}" -eq 64 ] || fail 'cannot read installed loader'
+	if [ "$current" = "$wanted" ]; then echo 'LT22M: already installed; no write'; exit 0; fi
+	printf '\nTarget: u-boot (mtd0, 0x000000-0x02ffff)\n'
+	target_kind=$kind
+	echo 'Installed:'
+	identify "$TMP/installed"
+	if [ "$kind" = unknown ]; then installed_unknown=1; else installed_unknown=0; fi
+	kind=$target_kind
+	# Firmware checks are diagnostics, not authorization for an operator-selected
+	# loader; a new loader may intentionally have a different boot policy.
+	scan_slots
+	if [ "$installed_unknown" -eq 1 ]; then
+		printf '\n%s\n' 'WARNING: installed bootloader is unrecognized.'
+	fi
+	if [ "$kind" = unknown ]; then
+		printf '\n%s\n' 'WARNING: selected loader is unrecognized; its bootability cannot be checked.'
+	fi
+	if [ "$candidate_bytes" -lt 65536 ]; then
+		printf '\nWARNING: only %s loader bytes supplied; %s bytes of this partition will be erased to 0xff.\n' \
+			"$candidate_bytes" "$((PART_SIZE - candidate_bytes))"
+	fi
+	printf '\n%s\n' 'Planned write: 0x000000-0x02ffff (u-boot). An interrupted write requires external SPI recovery.'
+	printf 'Type YES to flash the bootloader now: '
+	IFS= read -r reply </dev/tty || fail 'interactive terminal required'
+	[ "$reply" = YES ] || fail 'not confirmed'
+	check_device
+	dd if=/dev/mtd0 of="$TMP/before-write" bs=65536 count=3 2>/dev/null || fail 'cannot reread installed loader'
+	[ "$(wc -c < "$TMP/before-write")" -eq "$PART_SIZE" ] &&
+		[ "$(hash "$TMP/before-write")" = "$current" ] || fail 'installed loader changed'
+	[ "$(hash "$TMP/candidate")" = "$wanted" ] || fail 'candidate changed'
+	echo 'Flashing u-boot...' >&2
+	# mtd write erases NOR sectors before programming. Only mtd0 is passed.
+	mtd write "$TMP/candidate" u-boot || fail 'MTD write failed; do not reboot'
+	dd if=/dev/mtd0 of="$TMP/readback" bs=65536 count=3 2>/dev/null || fail 'readback failed; do not reboot'
+	[ "$(wc -c < "$TMP/readback")" -eq "$PART_SIZE" ] &&
+		[ "$(hash "$TMP/readback")" = "$wanted" ] || fail 'readback mismatch; do not reboot'
+	echo 'Readback: OK - all 196608 bytes match'
+	;;
+*) usage ;;
+esac
