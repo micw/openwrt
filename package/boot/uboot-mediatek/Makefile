@@ -207,6 +207,15 @@ define U-Boot/mt7628_rfb
   UBOOT_IMAGE:=u-boot-with-spl.bin
 endef
 
+define U-Boot/mt7628_tuoshi_lt22m
+  NAME:=Tuoshi LT22M 4G Wireless Router
+  BUILD_DEVICES:=tuoshi_lt22m tuoshi_lt22m_fullflash
+  BUILD_TARGET:=ramips
+  BUILD_SUBTARGET:=mt76x8
+  UBOOT_CONFIG:=tuoshi_lt22m_fullflash
+  UBOOT_IMAGE:=u-boot-with-spl.bin
+endef
+
 define U-Boot/mt7628_ravpower_rp-wd009
   NAME:=RAVPower RP-WD009
   BUILD_TARGET:=ramips
@@ -1487,6 +1496,7 @@ UBOOT_TARGETS := \
 	mt7623n_bpir2 \
 	mt7623a_unielec_u7623 \
 	mt7628_rfb \
+	mt7628_tuoshi_lt22m \
 	mt7628_ravpower_rp-wd009 \
 	mt7629_rfb \
 	mt7981_abt_asr3000 \
@@ -1593,6 +1603,12 @@ UBOOT_TARGETS := \
 	mt7988_tplink_tl-7dr7230-v1 \
 	mt7988_tplink_tl-7dr7230-v2 \
 	mt7988_tplink_tl-7dr7250-v1
+
+# Keep the LT22M flashable loader byte-identical across clean builds so its
+# independently reviewed hash can be pinned by the guarded flashing tool.
+ifeq ($(BUILD_VARIANT),mt7628_tuoshi_lt22m)
+UBOOT_MAKE_FLAGS += SOURCE_DATE_EPOCH=1790812800 LOCALVERSION="-OpenWrt-LT22M"
+endif
 
 UBOOT_CUSTOMIZE_CONFIG := \
 	--disable TOOLS_KWBIMAGE \

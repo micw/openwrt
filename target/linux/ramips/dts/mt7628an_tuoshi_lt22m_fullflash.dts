@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+/* Keep the stock board's peripherals and read-only factory NVMEM layout. */
+#include "mt7628an_tuoshi_lt22m.dts"
+
+/ {
+	compatible = "tuoshi,lt22m-fullflash", "mediatek,mt7628an-soc";
+	model = "Tuoshi LT22M 4G Wireless Router (fullflash)";
+
+	/delete-node/ virtual_flash;
+};
+
+&spi0 {
+	flash@0 {
+		partitions {
+			/delete-node/ partition@50000;
+			/delete-node/ partition@7c0000;
+			/delete-node/ partition@800000;
+			/delete-node/ partition@850000;
+			/delete-node/ partition@fc0000;
+
+			/* A single physical firmware region; factory stays read-only. */
+			partition@50000 {
+				label = "firmware";
+				reg = <0x50000 0xfb0000>;
+				compatible = "openwrt,uimage", "denx,uimage";
+			};
+		};
+	};
+};
