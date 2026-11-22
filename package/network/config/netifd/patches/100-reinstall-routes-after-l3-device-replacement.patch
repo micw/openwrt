@@ -1,0 +1,143 @@
+Subject: netifd: do not preserve routes across L3 ifindex changes
+
+When an L3 device is recreated with the same name, a protocol update can
+keep the interface up and replace route objects with identical routes.
+The old kernel routes were bound to the old ifindex and are no longer
+present, so do not preserve them on the replacement device.
+
+Refresh the claimed L3 device index before applying protocol updates and
+remember the actual output index of successfully installed routes. Copy
+it when preserving a route, and do not delete old routes via a different
+output index. Routes without an output interface are unaffected.
+
+diff --git a/interface-ip.c b/interface-ip.c
+index 12504e8..5a7aaff 100644
+--- a/interface-ip.c
++++ b/interface-ip.c
+@@ -909,6 +909,14 @@ interface_update_proto_neighbor(struct vlist_tree *tree,
+ 	}
+ }
+ 
++/* A same-name replacement may reuse the device object, but not its OIF. */
++static bool
++route_on_current_device(struct device *dev, struct device_route *route)
++{
++	return !route->installed_ifindex ||
++	       (dev && route->installed_ifindex == dev->ifindex);
++}
++
+ static void
+ __interface_update_route(struct interface_ip_settings *ip,
+ 			 struct vlist_node *node_new,
+@@ -930,13 +938,14 @@ __interface_update_route(struct interface_ip_settings *ip,
+ 	if (node_old && node_new)
+ 		keep = !memcmp(&route_old->nexthop, &route_new->nexthop, sizeof(route_old->nexthop)) &&
+ 			(route_old->mtu == route_new->mtu) && (route_old->type == route_new->type) &&
+-			(route_old->proto == route_new->proto) && !route_old->failed;
++			(route_old->proto == route_new->proto) && !route_old->failed &&
++			(route_old->enabled == enable_route(ip, route_new)) &&
++			route_on_current_device(dev, route_old);
+ 
+ 	if (node_old) {
+-		if (!(route_old->flags & DEVADDR_EXTERNAL) && route_old->enabled && !keep)
++		if (!(route_old->flags & DEVADDR_EXTERNAL) && route_old->enabled && !keep &&
++		    route_on_current_device(dev, route_old))
+ 			system_del_route(dev, route_old);
+-
+-		free(route_old);
+ 	}
+ 
+ 	if (node_new) {
+@@ -946,9 +955,15 @@ __interface_update_route(struct interface_ip_settings *ip,
+ 			if (system_add_route(dev, route_new))
+ 				route_new->failed = true;
+ 
++		if (keep)
++			route_new->installed_ifindex = route_old->installed_ifindex;
++
+ 		route_new->iface = iface;
+ 		route_new->enabled = _enabled;
+ 	}
++
++	if (node_old)
++		free(route_old);
+ }
+ 
+ static void
+@@ -1812,10 +1827,12 @@ interface_ip_set_route_enabled(struct interface_ip_settings *ip,
+ 	if (enabled) {
+ 		interface_set_route_info(ip->iface, route);
+ 
+-		if (system_add_route(dev, route))
+-			route->failed = true;
+-	} else
+-		system_del_route(dev, route);
++		route->failed = !!system_add_route(dev, route);
++	} else {
++		if (route_on_current_device(dev, route))
++			system_del_route(dev, route);
++		route->installed_ifindex = 0;
++	}
+ 
+ 	route->enabled = enabled;
+ }
+diff --git a/interface-ip.h b/interface-ip.h
+index b089e2c..072b8c6 100644
+--- a/interface-ip.h
++++ b/interface-ip.h
+@@ -91,6 +91,7 @@ struct device_prefix {
+ struct device_route {
+ 	struct vlist_node node;
+ 	struct interface *iface;
++	int installed_ifindex;
+ 
+ 	bool enabled;
+ 	bool keep;
+diff --git a/proto-ext.c b/proto-ext.c
+index 235c1c7..1ca9022 100644
+--- a/proto-ext.c
++++ b/proto-ext.c
+@@ -449,6 +449,10 @@ proto_ext_update_link(struct proto_ext_state *state, struct blob_attr *data, str
+ 		device_set_present(dev, true);
+ 	}
+ 
++	/* An already-claimed device may have been recreated under the same name. */
++	dev = iface->l3_dev.dev;
++	device_set_ifindex(dev, system_if_resolve(dev));
++
+ 	interface_update_start(iface, keep);
+ 
+ 	proto_apply_ip_settings(iface, data, addr_ext);
+diff --git a/system-linux.c b/system-linux.c
+index 56d52c1..a0552f6 100644
+--- a/system-linux.c
++++ b/system-linux.c
+@@ -4200,6 +4200,7 @@ static int system_rt(struct device *dev, struct device_route *route, int cmd)
+ 		.rtm_flags = (route->flags & DEVROUTE_ONLINK) ? RTNH_F_ONLINK : 0,
+ 	};
+ 	struct nl_msg *msg;
++	int ret;
+ 
+ 	if (cmd == RTM_NEWROUTE) {
+ 		flags |= NLM_F_CREATE | NLM_F_REPLACE;
+@@ -4275,7 +4276,11 @@ static int system_rt(struct device *dev, struct device_route *route, int cmd)
+ 		nla_nest_end(msg, metrics);
+ 	}
+ 
+-	return system_rtnl_call(msg);
++	ret = system_rtnl_call(msg);
++	if (!ret && cmd == RTM_NEWROUTE)
++		route->installed_ifindex = dev ? dev->ifindex : 0;
++
++	return ret;
+ 
+ nla_put_failure:
+ 	nlmsg_free(msg);
+@@ -4284,6 +4289,7 @@ nla_put_failure:
+ 
+ int system_add_route(struct device *dev, struct device_route *route)
+ {
++	route->installed_ifindex = 0;
+ 	return system_rt(dev, route, RTM_NEWROUTE);
+ }
+ 
